@@ -80,8 +80,27 @@ impl Deref for DxgiAdapter {
     }
 }
 
+/// `WGPU_DX12_ADAPTER_LUID` (hex, `HighPart:LowPart` or one 64-bit number):
+/// enumerate only that adapter. Exposing an adapter creates a D3D12 device on
+/// it, which wakes a sleeping discrete GPU (seconds on hybrid laptops) even
+/// when the application will use another one. An application that has
+/// already picked its adapter (by DXGI preference or LUID) can say so here.
+fn adapter_luid_filter() -> Option<(u32, i32)> {
+    let v = std::env::var("WGPU_DX12_ADAPTER_LUID").ok()?;
+    let v = v.trim().trim_start_matches("0x");
+    if let Some((high, low)) = v.split_once(':') {
+        let high = i32::from_str_radix(high.trim_start_matches("0x"), 16).ok()?;
+        let low = u32::from_str_radix(low.trim_start_matches("0x"), 16).ok()?;
+        Some((low, high))
+    } else {
+        let n = u64::from_str_radix(v, 16).ok()?;
+        Some((n as u32, (n >> 32) as i32))
+    }
+}
+
 pub fn enumerate_adapters(factory: DxgiFactory) -> Vec<DxgiAdapter> {
     let mut adapters = Vec::with_capacity(8);
+    let only = adapter_luid_filter();
 
     for cur_index in 0.. {
         profiling::scope!("IDXGIFactory1::EnumAdapters1");
@@ -96,6 +115,12 @@ pub fn enumerate_adapters(factory: DxgiFactory) -> Vec<DxgiAdapter> {
 
         if !should_keep_adapter(&adapter1) {
             continue;
+        }
+        if let Some((low, high)) = only {
+            let luid = unsafe { adapter1.GetDesc1() }.map(|d| d.AdapterLuid).ok();
+            if luid.is_none_or(|l| l.LowPart != low || l.HighPart != high) {
+                continue;
+            }
         }
 
         if let Ok(adapter4) = adapter1.cast::<Dxgi::IDXGIAdapter4>() {
