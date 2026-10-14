@@ -113,6 +113,36 @@ impl CompilerContainer {
         stage_bit: wgt::ShaderStages,
         full_stage: &str,
     ) -> Result<super::CompiledShader, crate::PipelineError> {
+        let debug = device
+            .shared
+            .private_caps
+            .instance_flags
+            .contains(wgt::InstanceFlags::DEBUG);
+        let compiler = match self {
+            CompilerContainer::Fxc(_) => "fxc",
+            CompilerContainer::DynamicDxc(_) => "dxc",
+            CompilerContainer::StaticDxc(_) => "static-dxc",
+        };
+        let cache = shader_cache::Entry::new(compiler, source, raw_ep, full_stage, debug);
+        if let Some(bytes) = cache.as_ref().and_then(shader_cache::Entry::load) {
+            return Ok(super::CompiledShader::Precompiled(bytes));
+        }
+        let compiled = self.compile_uncached(device, source, source_name, raw_ep, stage_bit, full_stage)?;
+        if let Some(cache) = cache {
+            cache.store(&compiled);
+        }
+        Ok(compiled)
+    }
+
+    fn compile_uncached(
+        &self,
+        device: &super::Device,
+        source: &str,
+        source_name: Option<&CStr>,
+        raw_ep: &str,
+        stage_bit: wgt::ShaderStages,
+        full_stage: &str,
+    ) -> Result<super::CompiledShader, crate::PipelineError> {
         match self {
             CompilerContainer::Fxc(CompilerFxc { fxc }) => compile_fxc(
                 device,
@@ -447,4 +477,87 @@ fn compile_dxc(
     let blob = get_output::<Dxc::IDxcBlob>(&compile_res, Dxc::DXC_OUT_OBJECT)?;
 
     Ok(crate::dx12::CompiledShader::Dxc(blob))
+}
+
+/// An on-disk cache of compiled shaders, enabled by `WGPU_DX12_SHADER_CACHE`
+/// (a directory). Compiling HLSL with FXC or DXC dominates pipeline creation
+/// on D3D12 (hundreds of milliseconds for a renderer's pipelines at startup),
+/// and the output depends only on what goes in: the compiler, the HLSL, the
+/// entry point, the target profile and the flags. Entries are keyed by a hash
+/// of those and this crate's version, written to a temporary file and renamed
+/// (concurrent processes can't leave a partial entry), and used only if they
+/// are a complete DXBC container (the format both compilers produce), so a
+/// damaged entry is compiled again rather than failing pipeline creation.
+mod shader_cache {
+    use alloc::{format, string::String, vec::Vec};
+    use std::path::PathBuf;
+
+    pub(super) struct Entry {
+        path: PathBuf,
+    }
+
+    impl Entry {
+        pub(super) fn new(compiler: &str, source: &str, entry: &str, profile: &str, debug: bool) -> Option<Self> {
+            let dir = PathBuf::from(std::env::var_os("WGPU_DX12_SHADER_CACHE")?);
+            let mut key = Fnv128::default();
+            for part in [env!("CARGO_PKG_VERSION"), compiler, entry, profile, if debug { "debug" } else { "release" }, source] {
+                key.write(part.as_bytes());
+                key.write(&[0xff]);
+            }
+            Some(Self { path: dir.join(format!("{}.dxbc", key.hex())) })
+        }
+
+        pub(super) fn load(&self) -> Option<Vec<u8>> {
+            let bytes = std::fs::read(&self.path).ok()?;
+            is_container(&bytes).then_some(bytes)
+        }
+
+        pub(super) fn store(&self, compiled: &super::super::CompiledShader) {
+            let code = compiled.create_native_shader();
+            // SAFETY: the bytecode belongs to `compiled`, alive for this call.
+            let bytes = unsafe { core::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) };
+            if !is_container(bytes) {
+                return;
+            }
+            let Some(dir) = self.path.parent() else { return };
+            if std::fs::create_dir_all(dir).is_err() {
+                return;
+            }
+            let tmp = self.path.with_extension(format!("{}.tmp", std::process::id()));
+            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &self.path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+
+    /// A DXBC container ("DXBC", a 16-byte checksum, a version, then its
+    /// total size), whole.
+    fn is_container(bytes: &[u8]) -> bool {
+        bytes.len() >= 32
+            && &bytes[..4] == b"DXBC"
+            && u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as usize == bytes.len()
+    }
+
+    /// FNV-1a, 128-bit: stable across builds and platforms (unlike std's
+    /// hashers), and no dependency.
+    struct Fnv128(u128);
+
+    impl Default for Fnv128 {
+        fn default() -> Self {
+            Self(0x6c62272e07bb014262b821756295c58d)
+        }
+    }
+
+    impl Fnv128 {
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 ^= u128::from(b);
+                self.0 = self.0.wrapping_mul(0x0000000001000000000000000000013b);
+            }
+        }
+
+        fn hex(&self) -> String {
+            format!("{:032x}", self.0)
+        }
+    }
 }
